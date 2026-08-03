@@ -295,3 +295,10 @@ switch v := x.(type) { ... }
 | `const` | compile-time | ✅         | ✅         | ❌       |
 | `var`   | runtime   | ✅          | ✅         | ✅       |
 | `:=`    | runtime   | ✅          | ❌         | ✅       |
+
+---
+
+## builtin.go — Key takeaways
+- **Aliases vs distinct types**: only `byte = uint8`, `rune = int32`, and `any = interface{}` use `=` — they are fully interchangeable. `int`, `uint`, `string` are declared as `type int int` etc., so they are **distinct types** — `int` is NOT an alias for `int32` even on 64-bit systems, and needs explicit conversion.
+- **`make` vs `new`**: `make(T, ...)` returns a ready-to-use value of type T (only for slice/map/chan). `new(T)` returns `*T` pointing to a zero-value of any type. Rule of thumb: use `make` when the type needs internal init (header, buckets, buffer); use `new` when you just want a zero-valued T on the heap.
+- **`comparable` is constraint-only**: `type comparable interface{ comparable }` — a special interface usable only as a **type parameter constraint** (`func Eq[T comparable](a, b T) bool`), never as a variable/field type. Same file also documents `error` as just `interface{ Error() string }` — nothing magical, only a convention.
