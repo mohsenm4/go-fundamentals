@@ -308,3 +308,78 @@ switch v := x.(type) { ... }
 - **Why `delete` returns nothing but `append` returns a slice**: maps are reference types — the variable is a pointer to a runtime hash table, so `delete` mutates in place. Slices are value types with a `{pointer, len, cap}` header — `append` may need a new header, so it must return one. Always write `s = append(s, x)`.
 
 _Read: 2026-08-08_
+
+---
+
+## io.go — Reader, Writer, and composition
+
+This file is one of the most interesting and useful packages in Go.
+
+This part is about the `Reader` and `Writer` interfaces, and how they combine into bigger interfaces like `ReadWriter`. This composition pattern is used widely across Go.
+
+- **Read**: you create a buffer (must be `[]byte`). The `Read` method fills your buffer with data from a source (file, network, memory, ...). Returns `n` (how many bytes were filled) and `err` (or `io.EOF` when the source ends).
+- **Write**: you give a buffer with data to the method, and it writes those bytes to a destination (file, network, buffer, ...).
+
+**Composition example** — `ReadWriter` has no methods of its own; it embeds `Reader` and `Writer`:
+```go
+type ReadWriter interface {
+    Reader
+    Writer
+}
+```
+Any type with both `Read(p []byte)` and `Write(p []byte)` methods automatically satisfies `ReadWriter`. Small interfaces + composition = flexible design.
+
+### Copy family and wrapper types
+
+This part of the file shows how much you can build on top of the tiny `Reader` / `Writer` interfaces. `Copy` and `CopyN` are the practical, everyday helpers — both funnel into `copyBuffer`, which uses `WriterTo` / `ReaderFrom` when available for a big performance win (for `*os.File`, that path uses `sendfile` and skips user-space entirely). On top of the basic interfaces, `io` ships wrapper types: `SectionReader` exposes a slice of a `ReaderAt` as its own `Reader` + `Seeker` + `ReadAt`; `OffsetWriter` is its mirror image for `WriterAt`; and `TeeReader` forwards every read into a second `Writer` — great for logging or hashing without changing the surrounding code. Finally there are utility values like `Discard` (a black-hole `Writer` that reuses buffers via `sync.Pool`) and `NopCloser` (adds a no-op `Close` to any `Reader`, and carefully forwards `WriteTo` if the underlying reader has one, so wrapping does not kill the fast path). The theme is the same throughout: two tiny interfaces, endless composition.
+
+_Read (lines 60–153): 2026-08-09_
+_Read (lines 329–750): 2026-08-10_
+
+### pipe.go and multi.go — bridging and combining streams
+
+`pipe.go` and `multi.go` live next to `io.go` and finish the picture of what the `io` package offers. `io.Pipe` is the only tool in the stdlib that converts direction: it hands out a `PipeReader` and `PipeWriter` sharing one unbuffered, synchronous, in-memory channel — so code that writes and code that reads can meet in the middle without a buffer in between. Every `Write` blocks until a matching `Read` copies bytes out; this gives backpressure for free and enables true streaming between an API that demands a `Writer` (e.g. `json.Encoder`, `gzip.Writer`) and one that demands a `Reader` (e.g. `http.Post`). Internally it uses two channels (`wrCh` for the write buffer, `rdCh` for the byte count acknowledgement) plus a `sync.Once` around `close(done)` so either side can close idempotently, and a small `onceError` helper that stores only the first error while allowing many reads. The `multi.go` file is the opposite: no goroutines, no synchronization — just composition. `MultiReader` concatenates readers sequentially (falling through to the next on EOF, and flattening nested `multiReader`s to keep the call chain shallow), and `MultiWriter` fans a single write out to many writers in order, stopping at the first error. Together, `Pipe` bridges producers to consumers, `MultiReader` glues sources end-to-end, `MultiWriter` broadcasts to sinks — three tiny APIs that show how far you can go with the two-method `Reader`/`Writer` interfaces at the core of `io.go`.
+
+_Read (pipe.go + multi.go): 2026-08-11_
+
+---
+
+## runtime/slice.go — how slices really work
+
+A slice is a 24-byte header: `array unsafe.Pointer`, `len int`, `cap int`. The data lives elsewhere. That single fact drives everything else.
+
+### slice header + aliasing
+
+Copying a slice (assignment or function call) copies only the header, not the backing array. Two slices sharing the same array will see each other's writes. A callee receives its own header copy — it cannot change the caller's `len`/`cap`, but it can absolutely rewrite the shared array. `append` inherits this: if `len < cap` the write goes into the caller's array *while* the caller keeps seeing the old `len`. Classic Go footgun and a real source of data races. Rule: always `s = append(s, x)`, and use `s[:len(s):len(s)]` to cap sub-slices you hand out.
+
+### makeslice — allocation with a safety net
+
+`make([]T, len, cap)` lowers to `runtime.makeslice`, which returns just an `unsafe.Pointer` (compiler already knows `len`/`cap` — no point returning a full header). Before allocating it multiplies `element_size * cap` through `math.MulUintptr`, which reports overflow. A silent overflow would turn `make([]int64, MaxInt64)` into an 8-byte allocation with a slice header claiming quintillions of slots — memory corruption. Go turns that into a clean panic. The message even distinguishes "len" vs "cap" by re-running the check with just `len`.
+
+Two subtleties around this function: (1) `//go:linkname makeslice` exists because external libs (`bytedance/sonic`, `cloudwego/dynamicgo`, `ugorji/codec`) reach into the private symbol; the runtime keeps a "hall of shame" comment as social pressure — Go can't make it public without freezing the API forever. (2) Panic paths live in separate tiny functions (`panicmakeslicelen`, `panicmakeslicecap`) so `makeslice` stays small enough for the compiler to inline it. Cold path out of the body → hot path stays fast.
+
+### growslice + nextslicecap — capacity growth
+
+When `append` runs out of room, `growslice` calls `nextslicecap` for the new capacity. The rule is a hybrid:
+- `newLen > 2*oldCap` → just return `newLen`
+- `oldCap < 256` → double
+- otherwise → grow by ~1.25× per iteration until `newcap >= newLen`
+
+The 1.25× formula `newcap += (newcap + 3*threshold) >> 2` is `newcap * 1.25 + 192` in disguise (`>> 2` = fast `/4`). The `+192` term smooths the transition around 256 so growth doesn't jerk from 2× to 1.25× at one point. Rationale: small slices favour speed (double, allocate rarely); large slices favour memory (doubling a 10M-element slice wastes a lot). Micro-optimization worth noticing: `doublecap := newcap + newcap` (add is a touch cheaper than mul in a hot function).
+
+### roundupsize — respecting size classes
+
+After `nextslicecap`, `growslice` calls `roundupsize`. One fact about Go's allocator: `mallocgc` doesn't hand out arbitrary sizes — only a fixed list of **size classes** (8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, ...). Ask for 17 bytes, get 24. This "internal fragmentation" is the cost of avoiding external fragmentation — the same trick tcmalloc/jemalloc/mimalloc use. It makes allocation O(1) via per-class free-lists.
+
+`roundupsize` answers: "if I ask for `size` bytes, what will `mallocgc` actually give me?" Two lookup-table hops for small allocations (`SizeToSizeClass8` / `SizeToSizeClass128` → `SizeClassToSize`), or page-align for large (>= 32KB). Pure arithmetic on tables generated by `mksizeclasses.go` — no allocation happens.
+
+`growslice` uses this to bump `cap` up to whatever the allocator was going to give anyway. If the formula said cap=16 but the nearest size class holds 18 slots, Go sets cap=18 — two free slots. This is why `cap(s)` after a grow often isn't the round number the doubling rule predicts.
+
+### Takeaways
+- Slice = 24-byte header. Everything else follows.
+- `append` returns a (possibly new) header — never mutates the caller's.
+- Aliasing + `cap > len` is the sharpest edge; use 3-index slicing to cap sub-slices.
+- Growth: 2× small, ~1.25× large, smooth transition. `roundupsize` bumps further to fit size classes.
+- Pre-size with `make([]T, 0, n)` when the final size is known — skips every grow.
+
+_Read (slice.go): 2026-08-12_
