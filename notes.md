@@ -383,3 +383,177 @@ After `nextslicecap`, `growslice` calls `roundupsize`. One fact about Go's alloc
 - Pre-size with `make([]T, 0, n)` when the final size is known — skips every grow.
 
 _Read (slice.go): 2026-08-12_
+
+---
+
+## errors — package basics
+
+The whole `errors` package is 91 lines. It exposes one function (`New`), one struct (`errorString`), one method (`Error`), and one sentinel value (`ErrUnsupported`). Everything else — `Is`, `As`, `Unwrap`, `Join` — lives in `wrap.go` and builds on this foundation.
+
+### the error interface
+
+Declared in `builtin.go`, not `errors.go`:
+
+```go
+type error interface {
+    Error() string
+}
+```
+
+Any type with an `Error() string` method automatically satisfies `error` — Go's implicit interface satisfaction at its simplest.
+
+### errorString and why pointer matters
+
+```go
+type errorString struct{ s string }
+func (e *errorString) Error() string { return e.s }
+func New(text string) error { return &errorString{text} }
+```
+
+Two things are deliberate here: the pointer receiver, and the `&` in `New`. Together they guarantee that every error returned by `New` has a **unique heap address**. This is what makes sentinel errors like `io.EOF` work:
+
+```go
+a := errors.New("EOF")
+b := errors.New("EOF")
+a == b   // false — different addresses
+a == io.EOF  // false — different addresses
+```
+
+If `New` returned a value (`errorString{text}` without `&`), interface equality would compare struct contents instead of pointer identity, and two independently-created "EOF" errors would compare equal — breaking every sentinel check in the standard library.
+
+**Takeaway**: pointer receiver here is not about mutation, it's about **identity**.
+
+### the sentinel error pattern
+
+```go
+var ErrUnsupported = errors.New("unsupported operation")
+```
+
+One instance per package, referenced by everyone. The `Err` prefix is convention. Callers use `errors.Is(err, ErrUnsupported)` rather than `err == ErrUnsupported` so that wrapped errors still match.
+
+Well-known examples across stdlib: `io.EOF`, `sql.ErrNoRows`, `context.Canceled`, `context.DeadlineExceeded`, `fs.ErrExist`, `fs.ErrNotExist`.
+
+### Unwrap is a convention, not an interface
+
+Nowhere in the `errors` package is there a declaration like `type Unwrapper interface { Unwrap() error }`. Instead, `wrap.go` uses a runtime type assertion:
+
+```go
+if u, ok := err.(interface{ Unwrap() error }); ok { ... }
+```
+
+Any error type that implements `Unwrap() error` (or `Unwrap() []error` for joined errors) participates automatically in `errors.Is` and `errors.As` chain walking. This is the smallest possible protocol: no import, no registration, no interface embed — just add the method and it works.
+
+### Takeaways
+
+- `error` is a one-method interface; that's why so many things "become" errors for free.
+- Pointer identity is what makes sentinels reliable — never compare error content when you meant to compare identity.
+- The `Err`-prefixed package-level variable is Go's standard way to expose a comparable sentinel.
+- `Unwrap()` is a duck-typed hook, not a declared interface; implementing it opts your error type into the whole `errors` toolkit.
+- Prefer `errors.Is(err, sentinel)` over `err == sentinel` — the former also matches wrapped errors.
+
+_Read (errors.go): 2026-08-15_
+
+---
+
+## errors — Is/As/Unwrap and chain walking
+
+Where `errors.go` defines the raw material (an error, a sentinel), `wrap.go` and `join.go` define the *protocol* for searching through error chains. The whole toolkit rests on three optional methods any error type may implement: `Unwrap() error`, `Unwrap() []error`, and `Is(error) bool`.
+
+### errors are trees, not chains
+
+Once `Join` exists, an error is no longer a linear chain — it's a tree. `errors.Is` and `errors.As` traverse this tree **pre-order, depth-first**: check the node itself, then recurse into each child. A single-wrapped error is just the degenerate case of a tree with one branch per node.
+
+```go
+a := errors.New("a")
+b := errors.New("b")
+outer := errors.Join(fmt.Errorf("wraps: %w", a), b)
+// tree:  outer ─┬── (wraps a) ── a
+//               └── b
+errors.Is(outer, a)  // true — depth-first found it
+errors.Is(outer, b)  // true — sibling branch
+```
+
+### Unwrap the function vs Unwrap the method
+
+The `Unwrap` **function** goes exactly one step:
+
+```go
+func Unwrap(err error) error {
+    u, ok := err.(interface{ Unwrap() error })
+    if !ok { return nil }
+    return u.Unwrap()
+}
+```
+
+The `Unwrap` **method** is what your type implements. The function calls the method. It handles only the single-wrap case (`Unwrap() error`); it does **not** descend into `Unwrap() []error` — that's what `Is`/`As` are for.
+
+### Is — three checks per node, in order
+
+```go
+for {
+    if targetComparable && err == target      { return true }   // 1. identity
+    if x, ok := err.(interface{ Is(error) bool }); ok && x.Is(target) { return true } // 2. custom Is
+    switch x := err.(type) {                                                          // 3. descend
+    case interface{ Unwrap() error }:   err = x.Unwrap(); ...
+    case interface{ Unwrap() []error }: for _, e := range x.Unwrap() { recurse... }
+    default: return false
+    }
+}
+```
+
+Two subtleties:
+- **`Comparable()` guard**: `target` gets a runtime check because comparing an incomparable type (e.g. struct with a slice field) would panic on `==`. `reflectlite.TypeOf(target).Comparable()` short-circuits step 1 for those.
+- **Custom `Is` method**: this is how types declare semantic equivalence to another error without wrapping it. `syscall.Errno.Is` is the canonical example — it maps OS-level error numbers to `fs.ErrExist`, `fs.ErrNotExist`, etc.
+
+### As and AsType — extract a typed value from the tree
+
+`As` fills a pointer; `AsType` (Go 1.20+) is the generic-native replacement:
+
+```go
+// old style
+var perr *fs.PathError
+if errors.As(err, &perr) { fmt.Println(perr.Path) }
+
+// preferred style
+if perr, ok := errors.AsType[*fs.PathError](err); ok { fmt.Println(perr.Path) }
+```
+
+`AsType` avoids the `**T` gymnastics, gives real generic type inference, and reads like `type assertion but chain-aware`. Package doc explicitly recommends preferring it over `As`.
+
+### Join — the multi-error tree node
+
+```go
+func Join(errs ...error) error {
+    // filter nils
+    // if zero remaining, return nil
+    // otherwise wrap in *joinError{errs: [...]}
+}
+
+type joinError struct { errs []error }
+func (e *joinError) Unwrap() []error { return e.errs }
+```
+
+Two contract details worth remembering:
+- **`Join(nil, nil, nil)` returns `nil`**, not an empty joined error. Zero non-nil inputs → nil output.
+- **The `Unwrap() []error` variant** is what makes `Is`/`As` recurse into every child. Without a slice-returning `Unwrap`, joined errors would be opaque.
+
+The `Error()` implementation uses `unsafe.String(&b[0], len(b))` instead of `string(b)` — a deliberate zero-allocation conversion, safe because the `[]byte` isn't used after that line.
+
+### The rule of thumb
+
+- **Sentinel comparison** → `errors.Is(err, ErrX)`
+- **Typed extraction** → `errors.AsType[*T](err)`
+- **Wrapping** → `fmt.Errorf("context: %w", err)` — never build a wrapper struct if you don't need custom fields
+- **Multiple errors** → `errors.Join(errs...)` — nil inputs are silently dropped
+- **Custom equivalence** → implement `Is(error) bool` on your type
+- **Custom type extraction** → implement `As(any) bool` on your type
+
+### Takeaways
+
+- The chain-walking algorithm is a `for` loop with three checks: identity, custom `Is`, then Unwrap-descend.
+- `errors.Unwrap` is one step; `errors.Is`/`As` are the whole tree. Never write your own recursion — use these.
+- `%w` in `fmt.Errorf` is the everyday way to wrap; a custom type with `Unwrap()` is only needed when you have extra fields.
+- `Join`'s `Unwrap() []error` turns a linear chain into a tree — think trees from day one, chains are a special case.
+- Prefer `AsType[T]` over `As(&target)` in Go 1.20+ code — it's the modern, generic-aware API.
+
+_Read (wrap.go + join.go): 2026-08-16_
