@@ -557,3 +557,202 @@ The `Error()` implementation uses `unsafe.String(&b[0], len(b))` instead of `str
 - Prefer `AsType[T]` over `As(&target)` in Go 1.20+ code — it's the modern, generic-aware API.
 
 _Read (wrap.go + join.go): 2026-08-16_
+
+---
+
+## runtime/string.go — internal layout
+
+A Go string is 16 bytes on a 64-bit machine: `str unsafe.Pointer` + `len int`. Nothing else. That header sits on the stack (or inside a struct); the actual bytes live elsewhere — read-only segment for literals, heap for dynamic strings, sometimes on the caller's stack via a compiler-managed temporary buffer. `stringStruct` in the runtime is the actual layout, and `stringStructDWARF` is the same shape with `*byte` instead of `unsafe.Pointer` so debuggers can render the contents.
+
+### immutability is a contract, not an enforcement
+
+There's no syntax for `s[0] = 'H'` — the compiler rejects it. But the runtime relies on immutability everywhere: sentinel error comparison, map keys, string interning, safe cross-goroutine sharing without a mutex. That trust chain is what makes `slicebytetostring` and `stringtoslicebyte` both copy: a `[]byte` is mutable, so a shared backing array between the two would let a caller silently rewrite a "string" someone else is holding. One line in the runtime confirms this — `// unlike slicerunetostring, no race because strings are immutable.` The escape hatch (`unsafe.String(&b[0], len(b))`) exists precisely because the safe path is otherwise mandatory.
+
+### slicebytetostring — a three-tier allocation strategy
+
+Every `string(b)` conversion routes through this function, and the tier depends on size and escape analysis:
+- **`n == 0`** → return `""`. Common enough that it's the first branch — parsing between markers hits this constantly.
+- **`n == 1`** → the `staticuint64s` trick. That's a 256-entry `[uint64]` array in RODATA (defined in `ints.s`), where entry `i` holds the value `i`. On little-endian, the byte at `&staticuint64s[i]` is `i` itself; on big-endian, the same byte lives at offset `+7`, hence the `if goarch.BigEndian { p = add(p, 7) }`. Zero allocation, forever. The same table is reused for interface conversion of small integers in `iface.go` — one 2KB table, two use cases.
+- **`n <= 64` and non-escaping** → the caller passes a `*tmpBuf` (a `[64]byte` on their stack), and the runtime copies into that. Zero heap allocation; the buffer dies with the caller's frame.
+- **otherwise** → `mallocgc(uintptr(n), nil, false)`. `typ == nil` tells the GC "no pointers inside, don't scan"; `needzero == false` skips zeroing because `memmove` overwrites everything immediately.
+
+Then `memmove` copies the bytes and `unsafe.String((*byte)(p), n)` wraps the destination in a string header.
+
+### stringtoslicebyte — the mirror image
+
+`[]byte(s)` uses the same two-tier idea (stack `tmpBuf` or heap `rawbyteslice`) but always copies. There's no single-byte trick going this direction, because the result is mutable — you can't point every `[]byte{x}` at a shared read-only slot, they'd alias each other.
+
+### concatstrings — two-pass to avoid quadratic copying
+
+`a + b + c` becomes `concatstring3(&tmpBuf, a, b, c)` at compile time (or `concatstrings(...)` for higher arity). The algorithm is two passes:
+1. Walk the strings once. Sum the lengths; count non-empty strings; catch overflow with the `l+n < l` trick (in unsigned arithmetic, if the sum wraps below the previous value, it overflowed).
+2. Handle two special cases before allocating:
+   - `count == 0` → all empty, return `""`.
+   - `count == 1` and the surviving string's data isn't on the current goroutine's stack (`stringDataOnStack`) → return that string directly. `"" + s + ""` costs zero.
+3. Otherwise, `rawstringtmp(buf, l)` — one allocation sized exactly to the total, on the caller's stack if it fits in the 64-byte `tmpBuf`, else on the heap.
+4. Walk again, `copy(b, x)` each source into the buffer.
+
+The alternative — building left-to-right (`(a+b)+c`) — would allocate a temporary for `a+b`, discard it, then allocate for the final result, doubling the copy of `a` and `b`. Two passes trade one extra `len(x)` walk for a single allocation. The pattern generalises: `strings.Builder` uses the same principle in a loop by growing its internal `[]byte` with the slice doubling rule instead of allocating per append. Anything in a loop that concatenates should use `Builder` (ideally with `Grow(size)` upfront) — measured benchmarks show 4–7× speedups and 3–18× fewer allocations for 18 short words.
+
+### Takeaways
+
+- A string is a 16-byte header. Everything else — literals in RODATA, stack temporaries, heap-allocated bodies — is arrangement of the underlying bytes.
+- Immutability is enforced by the compiler refusing index-assignment, and preserved by the runtime always copying at the `string ↔ []byte` boundary.
+- Three allocation tiers for `string(b)`: zero for empty/single-byte (`staticuint64s`), stack for small non-escaping (`tmpBuf`), heap otherwise (`mallocgc`). Escape analysis picks between the last two.
+- `concatstrings` is a two-pass measure-then-copy algorithm with a "single non-empty string" fast path. It guarantees exactly one allocation per `+` expression.
+- Inside a loop, always reach for `strings.Builder` — the runtime's `+` optimization is per-expression, not per-loop, so cumulative concatenation degrades to O(n²).
+- `unsafe.String(&b[0], len(b))` is the escape hatch when the safe copy cost is unacceptable. Correct usage means proving the `[]byte` won't be modified for the string's lifetime; getting it wrong corrupts everything downstream.
+
+_Read (string.go): 2026-08-18_
+
+---
+
+## sort.Interface — pre-generic polymorphism
+
+Before Go 1.18 there were no generics. If you wanted a generic algorithm that worked over any collection type, you had two bad choices: use `interface{}` with runtime type assertions (slow, unsafe), or write code generators. The `sort` package pioneered a third way that shaped Go's whole API design philosophy: **decouple the algorithm from the data by asking the caller to describe the data through a tiny interface**.
+
+### The interface — three methods against integer indices
+
+```go
+type Interface interface {
+    Len() int
+    Less(i, j int) bool
+    Swap(i, j int)
+}
+```
+
+The interface never touches the underlying element type. It only knows indices. The caller supplies:
+
+- how big the collection is,
+- whether index `i` should come before index `j`,
+- how to swap two indices.
+
+`sort.Sort` then runs an algorithm that only calls these three methods. The algorithm has no idea whether it is sorting integers, strings, database rows, or graph nodes. This is the same trick `heap.Interface`, `flag.Value`, and `image.Image` use — describe behaviour through minimal method sets, let the standard library do the heavy lifting.
+
+### The strict weak ordering contract
+
+`Less` is not just "return true if smaller". It must define a **strict weak ordering** — the mathematical guarantee that comparisons are consistent:
+
+- Transitivity: if `Less(i, j)` and `Less(j, k)` are both true, then `Less(i, k)` must be true.
+- Equality is expressed by *both* directions being false: if `Less(i, j)` and `Less(j, i)` are both false, `i` and `j` are considered equal.
+- Never true in both directions — that is a contradiction, and the algorithm will produce garbage, hang, or panic.
+
+The most common bug is writing `<=` instead of `<`. For equal elements `<=` returns true in both directions, and the sort silently corrupts.
+
+The floating-point NaN case is the canonical example: `NaN < 5.0` is false and `5.0 < NaN` is also false, so the raw `<` operator makes NaN "equal to everything" without being equal to anything. `sort.Float64Slice.Less` fixes this by forcing NaN to sort first:
+
+```go
+func (x Float64Slice) Less(i, j int) bool {
+    return x[i] < x[j] || (isNaN(x[i]) && !isNaN(x[j]))
+}
+```
+
+### `Sort` — four lines that guarantee O(n log n)
+
+```go
+func Sort(data Interface) {
+    n := data.Len()
+    if n <= 1 { return }
+    limit := bits.Len(uint(n))
+    pdqsort(data, 0, n, limit)
+}
+```
+
+Two subtleties worth noticing:
+
+- `n := data.Len()` is called **once** and cached. The docstring explicitly promises this ("one call to data.Len"). It is both a performance choice (avoiding repeated calls in the inner loop) and an API contract — the caller may implement `Len()` with an expensive computation and rely on it running exactly once.
+- `limit := bits.Len(uint(n))` is `⌈log₂(n)⌉`. It is the maximum number of bad (unbalanced) pivots the pdqsort recursion is allowed to make before falling back to heapsort. This is what turns quicksort's O(n²) worst case into a guaranteed O(n log n).
+
+### pdqsort, not introsort
+
+The docs and older articles frequently say "introsort" (quicksort + heapsort fallback). Since Go 1.19 the algorithm is **pdqsort** (pattern-defeating quicksort). The structure in `zsortinterface.go` is a three-way hybrid:
+
+```go
+if length <= maxInsertion {       // maxInsertion = 12
+    insertionSort(data, a, b)      // small ranges → insertion sort
+    return
+}
+if limit == 0 {
+    heapSort(data, a, b)           // too many bad pivots → heapsort
+    return
+}
+// otherwise: quicksort partition with smart pivot selection
+```
+
+Insertion sort wins on tiny ranges because its constant factor is tiny. Quicksort wins on average-case data. Heapsort is the worst-case safety net. The `limit` counter is what triggers the fallback — every time pdqsort picks a badly unbalanced pivot, `limit` drops. Adversarial or already-pathological inputs run out of budget after `log₂(n)` bad picks and get switched to heapsort.
+
+### `Reverse` — embedding as an override mechanism
+
+```go
+type reverse struct { Interface }
+func (r reverse) Less(i, j int) bool { return r.Interface.Less(j, i) }
+func Reverse(data Interface) Interface { return &reverse{data} }
+```
+
+Four lines produce a reversed sort without a new algorithm. The trick is Go's struct embedding: `reverse` inherits `Len` and `Swap` from the embedded `Interface`, and only overrides `Less`, swapping the argument order. This is the canonical "decorator" pattern in Go — wrap the value, override the one method you care about, get the rest for free. Same shape as `bufio.Reader` wrapping `io.Reader`, or middleware wrapping `http.Handler`.
+
+### `sort.Slice` — closure ergonomics, reflect cost
+
+Writing three methods just to sort a `[]Person` is tedious. `sort.Slice` lets you supply only the `Less` closure:
+
+```go
+sort.Slice(people, func(i, j int) bool {
+    return people[i].Age < people[j].Age
+})
+```
+
+The implementation (in `slice.go`) uses `reflectlite`:
+
+```go
+func Slice(x any, less func(i, j int) bool) {
+    rv := reflectlite.ValueOf(x)
+    swap := reflectlite.Swapper(x)
+    length := rv.Len()
+    limit := bits.Len(uint(length))
+    pdqsort_func(lessSwap{less, swap}, 0, length, limit)
+}
+```
+
+`reflectlite.Swapper(x)` builds a swap function at runtime by inspecting the slice element type. This works for any slice, but every swap pays a reflect penalty. Benchmarks typically show `sort.Slice` running 2–3× slower than a hand-rolled `sort.Interface` implementation. `pdqsort_func` (vs `pdqsort`) is a code-generated variant that takes function values instead of an interface — see the `//go:generate` directive at the top of `sort.go`.
+
+**When to choose**:
+- `sort.Sort` with a custom `Interface` — hot paths, large data, when the sort is called many times.
+- `sort.Slice` — one-off code, ergonomics matter more than a small perf delta.
+- `slices.SortFunc` (Go 1.21+) — the modern answer. Generic, no reflect, no allocation, closure-based ergonomics. `sort.Ints`, `sort.Float64s`, and `sort.Strings` are now thin wrappers over `slices.Sort`.
+
+### `Stable` — preserving the order of equal elements
+
+```go
+func Stable(data Interface) { stable(data, data.Len()) }
+```
+
+`Stable` guarantees that elements considered equal by `Less` keep their original relative order. Regular `Sort` provides no such guarantee. The cost is O(n · log² n) swaps versus Sort's O(n · log n) — the algorithm is a symmetric merge with block swaps rather than pdqsort.
+
+This matters because it enables **multi-key sorting by composition**. To sort by primary key A, then secondary key B, run stable sorts in the reverse order of importance:
+
+```go
+// Step 1: sort by the secondary key first.
+sort.SliceStable(books, func(i, j int) bool {
+    return books[i].Year > books[j].Year   // newest first
+})
+
+// Step 2: sort by the primary key. Equal-author books retain
+// the year ordering from step 1 because the sort is stable.
+sort.SliceStable(books, func(i, j int) bool {
+    return books[i].Author < books[j].Author
+})
+```
+
+If you used non-stable `Slice` in step 2, the year ordering from step 1 would be scrambled inside each author group. The pattern generalises to N keys — sort N times, from least important to most important, always stable.
+
+### Takeaways
+
+- `sort.Interface` decouples algorithms from data by exposing only Len/Less/Swap over indices — no knowledge of the element type. This is Go's answer to generics before generics existed, and remains the clearest example of interface design in the stdlib.
+- `Less` must define a strict weak ordering. The failure mode is silent: using `<=` where you meant `<` produces contradictory comparisons and corrupt sorts. NaN is the canonical case where `<` alone is not enough.
+- `Sort` promises exactly one `Len()` call — both a performance choice and an API contract callers can rely on.
+- The algorithm is pdqsort (not introsort since Go 1.19): a three-way hybrid of insertion sort for tiny ranges, quicksort for the general case, heapsort as the O(n log n) fallback when `limit` (initialised to `log₂(n)`) runs out.
+- `Reverse` demonstrates the decorator pattern via struct embedding — override one method, inherit the rest. Idiomatic Go, worth internalising.
+- `sort.Slice` trades performance for ergonomics using reflect; `sort.Sort` with a custom Interface is 2–3× faster. Modern code should reach for `slices.SortFunc` instead — same ergonomics, no reflect.
+- `Stable` costs O(n · log² n) swaps but enables multi-key sorting by composition. Rule: sort N times, from least important key to most important, always stable.
+
+_Read (sort.go + slice.go + zsortinterface.go): 2026-08-20_
