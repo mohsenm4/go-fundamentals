@@ -901,3 +901,120 @@ SIMD parallel matching is a further order-of-magnitude win, but only if the rest
 - If I were retrofitting a production map without going full SIMD, the two changes with the best cost/benefit ratio would be quadratic probing (removes clustering, two-line change) and bounded-size Tables with per-Table splits (removes latency spikes on grow).
 
 _Read (internal/runtime/maps/{map,table,group}.go): 2026-08-26_ · _Wrote (04-hashmap/hashmap.go): 2026-08-26_
+
+---
+
+## Go Memory Model — happens-before and sync semantics
+
+Reference: [go.dev/ref/mem](https://go.dev/ref/mem)
+
+### The problem: why do we need a memory model?
+
+Without synchronization, three actors can reorder your writes so another goroutine sees them out of order:
+
+| Actor    | What it does                                                                       |
+| -------- | ---------------------------------------------------------------------------------- |
+| Compiler | Reorders independent statements when it thinks the result is faster                |
+| CPU      | Uses store buffers — writes may reach main memory later than issued                |
+| Cache    | Each core has its own cache — a write on core A is not instantly visible on core B |
+
+Classic broken example:
+
+```go
+var a = 0
+var done = false
+
+// goroutine 1
+a = 42
+done = true
+
+// goroutine 2
+if done {
+    fmt.Println(a) // may print 0, not 42
+}
+```
+
+There is no guarantee that goroutine 2 sees `a=42` even when it sees `done=true`. The writes can be reordered, delayed in a store buffer, or invisible in another core's cache.
+
+### happens-before
+
+The memory model defines a relation called **happens-before** between events (reads, writes, sync ops) across all goroutines.
+
+> If event A **happens-before** event B, then any goroutine that observes the effect of B is guaranteed to also observe the effect of A.
+
+Key properties:
+
+- It is a **partial order**, not a total order. Some events have no ordering relation → those are candidates for a data race.
+- A read of variable `v` is allowed to observe a write to `v` only if that write is not ordered _after_ the read by happens-before, and no later write is ordered before the read.
+- If two goroutines access the same variable without a happens-before between the accesses, and at least one is a write, that is a **data race**. Behavior is undefined.
+
+### What creates happens-before in Go
+
+Plain assignment does not. You need one of these sync primitives:
+
+1. **`sync.Mutex` / `sync.RWMutex`**
+   - `Unlock()` on mutex `m` happens-before the next `Lock()` on the same `m` returns.
+   - For `RWMutex`: `Unlock()` happens-before any subsequent `RLock()` return; `RUnlock()` happens-before any subsequent `Lock()` return.
+
+2. **Channels**
+   - A send on channel `c` happens-before the corresponding receive from `c` completes.
+   - The `k`th receive on a channel with capacity `C` happens-before the `(k+C)`th send completes (backpressure ordering).
+   - `close(c)` happens-before a receive that returns because the channel is closed.
+
+3. **`sync/atomic`**
+   - An atomic operation A happens-before atomic operation B on the same address if A is sequenced before B in program order and A is a "release" and B is an "acquire" (all Go atomics are sequentially consistent by default).
+
+4. **`sync.Once`**
+   - The completion of the function `f` inside `once.Do(f)` happens-before the return of any other `once.Do(f)` call.
+
+5. **Goroutine start**
+   - The `go f()` statement happens-before the start of `f`'s execution.
+
+6. **Goroutine exit**
+   - The exit of a goroutine happens-before **no** event. If you need to wait for it, use `sync.WaitGroup` or a channel — the exit itself provides no synchronization.
+
+### Why a mutex is not "just a lock"
+
+A mutex does two things, and the second is the one people forget:
+
+1. **Mutual exclusion** — only one goroutine holds it at a time.
+2. **Memory barrier** — `Unlock` tells the CPU to flush pending writes to main memory; the next `Lock` tells the CPU to invalidate its cache and reload from memory.
+
+Without the barrier, each core would happily live in its own cache and never see the others' writes. Locks give you _both_ exclusion and visibility. This is why replacing a mutex with a plain `bool` flag is broken even if only one goroutine writes it.
+
+### Practical rules
+
+- If two goroutines share a variable and at least one writes, protect it with a mutex, atomic, or channel. No exceptions.
+- Never assume word-sized writes are atomic. On most architectures they are, but the memory model does not guarantee it — a torn read is legal.
+- The race detector (`go test -race`, `go run -race`) finds violations at runtime. It has false negatives (only catches races that actually happen during the run), never false positives. Run it in CI.
+- Double-checked locking is broken in Go without `sync/atomic` or `sync.Once`. The "fast path" read outside the lock has no happens-before with the write inside the lock.
+
+_Read (go.dev/ref/mem — Introduction, Advice, Informal Overview, Synchronization): 2026-08-30_
+
+## runtime/proc.go — G-M-P scheduler basics
+
+Why G-M-P: Replaces heavy, expensive OS threads with lightweight, cheap goroutines.
+
+Roles in one word: G = Task/Code, M = Worker (OS Thread), P = Resource/Execution Context.
+
+runnext slot: A 1-element fast track; runs the woken goroutine immediately to exploit CPU cache locality.
+
+Local Runqueue: Lockless 256-element array; owner pops from head, pushes to tail; stealers CAS the head.
+
+findrunnable ordering: Local → Global → Netpoller → Steal → Park. (The `schedtick % 61 == 0` check prevents Global queue starvation).
+
+_Read (src/runtime/proc.go — schedule, findrunnable, runqput, runqget) + Kavya Joshi "The Scheduler Saga": 2026-09-03_
+
+## runtime/chan.go — hchan struct anatomy
+
+buf (unsafe.Pointer): Enables generic storage (pre-generics) and contiguous allocation with hchan.
+
+Circular Buffer: dataqsiz (capacity), qcount (item count), sendx (write index), recvx (read index).
+
+waitq + sudog: Linked list of blocked Gs. sudog wraps a G so one G can wait on multiple channels (select).
+
+runtime.mutex vs sync.Mutex: Avoids bootstrap circularity (sync.Mutex depends on gopark).
+
+Buffered vs Unbuffered: Unbuffered has dataqsiz = 0 and bypasses buffer via sendDirect (stack-to-stack copy). Buffered uses dataqsiz > 0.
+
+_Read (src/runtime/chan.go — hchan struct + file-top comments): 2026-09-03_
