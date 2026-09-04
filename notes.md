@@ -756,3 +756,148 @@ If you used non-stable `Slice` in step 2, the year ordering from step 1 would be
 - `Stable` costs O(n · log² n) swaps but enables multi-key sorting by composition. Rule: sort N times, from least important key to most important, always stable.
 
 _Read (sort.go + slice.go + zsortinterface.go): 2026-08-20_
+
+---
+
+## internal/runtime/maps — Swiss Tables architecture (H1/H2, control word, Group)
+
+Go 1.24 (February 2025) rewrote the entire map implementation. The old `runtime/map.go` — a chained hashmap where every bucket held eight `(key, value)` pairs and collisions spilled into linked overflow buckets — is now a thin shim. The real code lives in `internal/runtime/maps/`, and the design is a Go port of Google's Swiss Tables (open in Abseil since 2017). The migration wasn't cosmetic. Three properties of modern CPUs made chaining a bad fit: cache lines are 64 bytes and pointer-chasing wastes them, SIMD can compare 16 bytes in a single instruction and a per-bucket loop can't, and grow-time rehashing of a million-entry map produced latency spikes that were hard to bound. Swiss Tables address all three with one design: contiguous 8-slot groups, a compact metadata word compared in parallel, and per-table splitting instead of whole-map rehash.
+
+### The hierarchy — Map → directory → Table → Group → Slot
+
+A `Map` no longer owns a single flat array of buckets. It owns a **directory** — an array of pointers to `Table` structs. Each `Table` owns a small array of `Group`s. Each `Group` owns exactly 8 slots plus an 8-byte control word describing those slots. The five-level shape is deliberate: the outer layers (`Map`, directory, `Table`) exist so growth can happen incrementally — one `Table` at a time — instead of rehashing the whole map at once. The inner layers (`Group`, slot) are cache-line-friendly and designed for parallel matching.
+
+The number eight is not arbitrary. AMD64 SIMD instructions like `pmovmskb` operate on 128-bit registers as sixteen 8-bit lanes; the 8-byte control word fits half a register and produces an 8-bit match bitmask in one instruction. The choice cascades: 8 slots per group → 8-byte control word → one SIMD op per lookup step. If you understand nothing else about Swiss Tables, understand that the architecture is shaped around a single hardware primitive.
+
+### H1/H2 split — 57 bits for probing, 7 bits for the control word
+
+Every key gets hashed to a 64-bit value, then split asymmetrically:
+
+- **H1** — the upper 57 bits, used to pick the starting `Group` (`H1 mod numGroups`).
+- **H2** — the lower 7 bits, used as a fingerprint stored inside the control word.
+
+The split is asymmetric because the control word has room for only 7 bits per slot — the top bit is reserved for state (empty vs occupied vs tombstone). H2 alone is not enough to identify a key: with only 7 bits, roughly 1 in 128 unrelated keys will match by accident. That's why matching H2 is only a filter — every hit must be confirmed with a full key comparison. What H2 buys is speed: reject 127 out of 128 non-matches in one SIMD instruction before ever touching the actual keys.
+
+### The control word — 8 bytes describing 8 slots
+
+The control word is the beating heart of Swiss Tables. One byte per slot, encoding both state and fingerprint:
+
+```
+0x80              → empty
+0xFE              → tombstone (deleted, but probe chain must continue)
+0hhhhhhh (H2)     → occupied, low 7 bits carry the H2 fingerprint
+```
+
+The high bit is the state marker. Empty slots use `0x80` (top bit set, rest zero) so a byte-wide `& 0x80` reveals emptiness. Tombstones use `0xFE` — top bit set, rest one — distinguishing them from empty when a delete needs to preserve the probe chain. Occupied slots always have the top bit clear, so `H2 & 0x7F` never collides with `0x80` or `0xFE`.
+
+Because all 8 bytes live in a single machine word, the CPU loads all slot metadata in one memory access. A lookup that finds nothing in the group still pays only one cache miss for the metadata — the actual keys are only touched when H2 says there might be a match.
+
+### Takeaways
+
+- Swiss Tables replaced `hmap` in Go 1.24 because chaining wasted cache lines, couldn't use SIMD, and produced unpredictable grow latency. The redesign fixes all three with one shape: contiguous 8-slot groups + compact control word + per-table splitting.
+- The hierarchy Map → directory → Table → Group → Slot exists for two reasons: outer layers (Table + directory) enable incremental grow via extendible hashing; inner layers (Group + control word) enable SIMD parallel matching.
+- H1/H2 splits the 64-bit hash asymmetrically: 57 bits pick the Group, 7 bits become an in-control-word fingerprint. H2 filters candidates in one instruction but never confirms — every H2 match still requires a real key comparison because 1 in 128 unrelated keys collide.
+- The control word encodes state and fingerprint in one byte per slot: `0x80` empty, `0xFE` tombstone, `0hhhhhhh` occupied. Living in one machine word is what makes the whole design possible.
+
+_Read (internal/runtime/maps/{map,table,group}.go): 2026-08-26_
+
+---
+
+## Swiss Table lookup: probe sequence + parallel match
+
+A Swiss Table lookup is three steps: find the starting Group from H1, filter candidate slots with `matchH2` on the control word, then verify each candidate with a real key comparison. If the Group has no match but also no empty slot, probe to the next Group using a quadratic sequence. The design is a careful balance — H2 filters cheaply, key compare confirms correctly, and the probe rule guarantees every Group is visited exactly once before giving up.
+
+### Step 1 — H1 picks the starting Group
+
+```go
+startGroup := h1 % numGroups
+```
+
+Because `numGroups` is always a power of two, the modulo compiles to a single bitwise `AND (numGroups - 1)`. This is a hard constraint: everything downstream — the quadratic probe formula, the extendible hashing directory sizing, the small-map optimization — assumes power-of-two sizing.
+
+### Step 2 — `matchH2`: parallel compare with bit tricks
+
+Once you're in a Group, you have 8 slots and an 8-byte control word describing them. The naive approach — loop 8 times, compare each byte to H2 — is exactly what chaining did and exactly what Swiss Tables avoid. Instead, `matchH2` runs three bitwise operations over the whole control word simultaneously:
+
+```
+// pseudocode; real code uses SIMD on amd64
+func matchH2(cw uint64, h2 byte) uint8 {
+    // 1. XOR each byte with a repeated H2. Matching bytes become 0x00.
+    x := cw ^ (uint64(h2) * 0x0101010101010101)
+    // 2. Bit-tricks to produce 0x80 for each byte that was 0x00.
+    y := (x - 0x0101010101010101) & ^x & 0x8080808080808080
+    // 3. Compress those 0x80 markers into an 8-bit mask.
+    return compressToBitmap(y)
+}
+```
+
+On AMD64 the whole thing is one `pmovmskb` after a SIMD compare — 16 lanes in ~1 nanosecond. The output is a bitmask where bit `i` is set if slot `i` has a fingerprint matching H2. No loops, no branches, no per-slot dispatch.
+
+The false-positive rate is `2^-7 = 1/128`. So `matchH2` might return spurious matches, but at that rate the wasted work is negligible compared to the branch-free win.
+
+### Step 3 — Verify with key compare, then probe
+
+For each bit set in the match bitmask, load the actual key from that slot and compare to the lookup key. First real match → return the value. If all H2 candidates fail (false positives), continue.
+
+Then check the control word for any empty slot (`0x80`). If found, the key **cannot exist** — the probe chain would have stopped here on insertion, so if it isn't in this Group and there's still empty room, it was never inserted anywhere down the chain. Return "not found".
+
+If the Group is full (no empty, no match), the key might be further down. Probe to the next Group using the quadratic sequence and repeat.
+
+### Quadratic probing — `p(i) = start + (i² + i)/2 mod n`
+
+Linear probing (`p(i) = start + i`) has a classic pathology called **primary clustering**: once collisions form a run of occupied slots, every subsequent insert into that region extends the run, and lookup times degrade quadratically with load. Quadratic probing breaks the pattern by taking increasingly-spaced jumps: `+1, +3, +6, +10, +15, ...`.
+
+The specific formula `(i² + i)/2 mod n` isn't cosmetic. When `n` is a power of two, this sequence is a **bijection on Z/nZ** — every value from 0 to n-1 appears exactly once as `i` goes from 0 to n-1. That guarantees the probe will visit every Group before giving up, so a key present anywhere in the table will be found, and a full table won't cause an infinite loop.
+
+### Takeaways
+
+- Lookup is three steps: H1 → starting Group, `matchH2` → candidate slots, key compare → confirm. The design is built around H2 filtering being cheap and wrong-sometimes; key compare being expensive and always-right.
+- `matchH2` uses three bitwise ops (or one SIMD instruction on amd64) to compare H2 against all 8 slots at once and return an 8-bit match mask. No loop, no branch — this is the operation that makes the whole architecture worth it.
+- An empty slot (`0x80`) in the current Group ends the search. This is why delete cannot simply zero a slot — that would end searches early and break the probe chain. Tombstones (`0xFE`) exist for exactly this reason.
+- Quadratic probing with `p(i) = start + (i² + i)/2 mod n` avoids the primary clustering of linear probing, and because `n` is always a power of two, the sequence is a bijection — every Group visited exactly once before terminating.
+
+_Read (internal/runtime/maps/table.go + group.go): 2026-08-26_
+
+---
+
+## hashmap with open addressing — my implementation vs stdlib Swiss Tables
+
+Writing [04-hashmap/hashmap.go](04-hashmap/hashmap.go) after reading `internal/runtime/maps` made the design differences between a textbook open-addressing map and a production one concrete. The core ideas — open addressing, probing, tombstones, load-factor-triggered resize — carry over. What's different is that stdlib takes every one of them and does it in a way that's specifically tuned for how CPU cache lines, SIMD, and predictable-latency growth work.
+
+### What my implementation shares with stdlib
+
+Both use open addressing rather than chaining — no linked overflow lists, keys live directly in the primary array. Both use tombstones for delete: a plain removal would break the probe chain by turning an occupied slot into empty, causing subsequent lookups to stop early and miss keys that legitimately hashed further down. My `entry.state` field uses `0/1/2` for empty/occupied/tombstone; stdlib uses `0x80/0xhh/0xFE` in a control byte — same three states, different encoding for different reasons (mine is readable, theirs is SIMD-friendly).
+
+Both trigger resize based on load. Mine uses `(size + tombstones) * 4 >= len(slots) * 3`, effectively a 75% threshold that includes tombstones — this matters because a table dense with tombstones probes as badly as one dense with real entries, even if `size` looks low. Stdlib uses a similar rule per-Table with `maxTableCapacity = 1024`.
+
+### What stdlib does that mine doesn't
+
+- **Groups of 8 with a control word.** My design is one slot per index. Stdlib bundles 8 slots into a Group with an 8-byte metadata word packed alongside. This is the entire point: hardware can load and process the metadata for all 8 slots in one instruction.
+- **`matchH2` parallel filter.** My lookup walks slots one at a time, comparing each `entry.key` to the search key. Stdlib does an SIMD compare of H2 against all 8 control bytes at once, then does a full key compare only for the ~1/128 that matched. The typical lookup touches one Group's metadata (cheap) and zero or one full keys (also cheap).
+- **Quadratic probing, not linear.** I picked linear probing because it's two lines and easy to reason about (`index = (index + 1) % len(h.slots)`). It also clusters badly at high load: any run of collisions absorbs subsequent inserts and grows. Stdlib probes with `p(i) = start + (i²+i)/2 mod n`, which breaks clusters without giving up the "visits every group exactly once" guarantee.
+- **Extendible hashing on grow.** My `resize()` copies every occupied entry from the old array into a new array of double size, in one shot. For a map of 1 million entries, that's 1 million rehashes and copies at once — a latency spike. Stdlib bounds each Table at 1024 entries; when one fills up, it splits *only that Table* into two, updates the directory, and moves at most ~1024 entries. The bound holds regardless of overall map size, so grow latency is independent of scale.
+- **Small-map optimization.** For maps with ≤ 8 entries, stdlib skips the Table layer entirely — `dirPtr` points directly at a single Group. No probe sequence, no tombstones, no directory. My design pays the full open-addressing cost even for a two-entry map.
+
+### Trade-offs I accepted
+
+Linear probing gave me clarity — I can trace a lookup by hand. Quadratic probing needs more thought about whether the formula covers every slot (only if `n` is a power of two). Full rehash on grow is O(n) but has zero conceptual overhead; extendible hashing needs a directory abstraction, local vs global depth tracking, and Table-level splitting logic. And running everything as individual slots without a control word means my `Get` is a comparison loop instead of a bitwise trick — slower, but the loop fits in my head without diagrams.
+
+For a hobby-scale hashmap this is fine. For a language runtime where `map[string]int` is one of the hot paths across every program ever written in the language, none of it is fine.
+
+### What I'd change if this were production
+
+The two most impactful changes wouldn't be SIMD — that's platform-specific and Go abstracts it. They'd be:
+
+1. **Quadratic probing.** Two-line change to the probe formula, no other design impact, removes worst-case clustering behavior. Costs nothing.
+2. **Cap resize granularity.** Split into a fixed-size table structure so a single grow moves at most N entries. This alone eliminates the pathological "the map hit its limit and now the request-handling latency spiked by 200ms" incident that killed old chaining-based `hmap` in some workloads.
+
+SIMD parallel matching is a further order-of-magnitude win, but only if the rest of the design (Group layout, control word, fingerprint) is already in place. It's not something you retrofit — the data structure has to be shaped for it from the start.
+
+### Takeaways
+
+- Open addressing, tombstones, and load-factor resize are the shared foundation between any textbook implementation and stdlib Swiss Tables. The interesting engineering is all in *how* those primitives are laid out for hardware.
+- The single biggest win of Swiss Tables over a naive open-addressing map is `matchH2` — one SIMD instruction that filters 128 candidates down to 1 without any per-slot branching. Everything else in the design exists to make that instruction possible.
+- Extendible hashing is what makes stdlib's grow cost independent of map size. My full-rehash approach is O(n) per grow; stdlib's is O(1024) per grow, regardless of whether the map has 10k or 10M entries.
+- If I were retrofitting a production map without going full SIMD, the two changes with the best cost/benefit ratio would be quadratic probing (removes clustering, two-line change) and bounded-size Tables with per-Table splits (removes latency spikes on grow).
+
+_Read (internal/runtime/maps/{map,table,group}.go): 2026-08-26_ · _Wrote (04-hashmap/hashmap.go): 2026-08-26_
