@@ -244,6 +244,14 @@ var (
 )
 ```
 
+## Zero values and nil semantics
+
+- **Slice**: `var s []int` (nil) vs `s := []int{}` (empty) — both `len==0`, `cap==0`, both `range` zero times, both `append` identically (fresh backing array on first append). Only real differences: `s == nil` is `true` for nil / `false` for empty (empty has a valid non-nil pointer to a zero-size array), and JSON marshaling — nil → `null`, empty → `[]`.
+- **Map**: reading from nil map is safe, returns zero value; `len==0`; `delete` is a safe no-op. Writing panics: "assignment to entry in nil map". Must `make()` before any write.
+- **Channel**: send/receive on nil channel blocks forever (not a panic — actually useful in `select` to disable a case). `close(nilChan)` panics: "close of nil channel". `len`/`cap` both 0.
+- **Interface**: holding a nil pointer of a concrete type makes the interface itself non-nil — `interface = (type, value)`, type part is set even when value is nil. Classic trap: `var p *T = nil; var i error = p; i != nil` → `true`.
+
+
 ### 6.5 Rules
 - No initializer → zero value.
 - No type → type taken from initializer; **untyped constants converted to default type**; untyped bool → `bool`.
@@ -1018,3 +1026,55 @@ runtime.mutex vs sync.Mutex: Avoids bootstrap circularity (sync.Mutex depends on
 Buffered vs Unbuffered: Unbuffered has dataqsiz = 0 and bypasses buffer via sendDirect (stack-to-stack copy). Buffered uses dataqsiz > 0.
 
 _Read (src/runtime/chan.go — hchan struct + file-top comments): 2026-09-03_
+
+## runtime/proc.go — G-M-P scheduler basics
+
+**The three players**: G (goroutine — the task + its stack), M (OS thread — the actual CPU worker), P (processor/context — holds the local run queue and the resources an M needs to run Go code, count = GOMAXPROCS). An M can't run Go code without holding a P.
+
+**Local run queue (`pp.runq`)**: a fixed-size (256) circular array on each P, no lock — just `atomic` head/tail. Why lock-free is safe here: only the *owner* P ever pushes new work in; other P's are only allowed to read from the other end (steal). One-writer-many-occasional-readers is a well-known pattern (a work-stealing deque) that doesn't need a mutex.
+
+**`runnext` — the fast-track slot**: a single extra slot outside the ring, set with a CAS loop (`runqput`, line ~7060). A newly-spawned goroutine usually lands here instead of the back of the queue — cache is still warm from the goroutine that just created it, so running it next is cheap. If `runnext` was already occupied, the old occupant gets kicked to the back of the regular queue (not lost).
+
+**Overflow → global queue (`runqputslow`)**: when the local ring is full, instead of moving items one at a time (which would mean grabbing the global lock repeatedly), the owner P grabs *half* its local queue as one batch and dumps it on the global run queue in a single locked operation. Fewer lock acquisitions = less contention.
+
+**`findRunnable()` search order** (verified against Go 1.26 source, `proc.go`):
+1. **Local queue** (`runqget`) — cheapest, no lock.
+2. **Global queue** — but only unconditionally checked every 61 scheduler ticks (`pp.schedtick % 61 == 0`), even if the local queue isn't empty. Why: without this, two goroutines that keep re-spawning each other could hog a P's local queue forever and starve everything sitting on the global queue. This is the scheduler's fairness escape hatch.
+2b. Otherwise, global queue is tried right after local is empty.
+3. **Netpoll** — check if any network I/O completed and unblocked a goroutine, before resorting to the expensive option.
+4. **Work stealing** — an idle/spinning M starts grabbing work from *other* P's local queues (from the tail, i.e., the "cold" end, to avoid fighting the owner over `runnext`).
+5. **Park** — nothing found anywhere; the M gives up its P and goes to sleep until woken.
+
+**Lock-free vs locked — the general lesson**: whether a data structure needs a mutex isn't about "is it shared" (the local run queue *is* shared, via stealing) — it's about the *shape* of the sharing. Single-writer/occasional-reader → atomics are enough. Genuinely multi-writer/multi-reader with several fields that must change together (like a channel's buffer + wait queues + closed flag) → a real lock is simpler and safer than trying to be clever with atomics.
+
+---
+
+## runtime/chan.go — hchan struct anatomy + chansend walkthrough
+
+**Struct fields** (Go 1.26; two fields — `timer`, `bubble` — are newer than what older references describe, used for timers and the `synctest` testing package; core logic is unchanged):
+- `qcount`, `dataqsiz` — how many elements are queued right now, and the buffer's total capacity.
+- `buf` — pointer to the circular buffer array (only allocated if the channel has a buffer size > 0).
+- `sendx`, `recvx` — the write/read cursors into that circular buffer (each wraps back to 0 after reaching `dataqsiz`).
+- `recvq`, `sendq` — FIFO linked lists (`waitq`) of `sudog`, i.e., goroutines currently parked waiting to receive / to send.
+- `closed` — 0 or 1.
+- `lock mutex` — a low-level `runtime.mutex`, **not** `sync.Mutex`. Why: `sync.Mutex` itself is implemented using `gopark`/`goready`, which are runtime primitives — channels sit *below* that layer, so using `sync.Mutex` here would be circular (it would depend on machinery that itself might depend on channels).
+
+**Invariant from the file's own header comment**: "`qcount > 0` implies `recvq` is empty" (and vice versa for send). In plain words: you can never simultaneously have data sitting in the buffer *and* a goroutine parked waiting to receive — if a receiver is already waiting, the next value skips the buffer and goes straight to them.
+
+**`chansend` — the four paths** (real source, `chan.go` ~line 176-310):
+1. **`c == nil`** → `gopark` forever. Not a panic — a permanent block. (Useful trick: in a `select`, nil-ing out a channel variable is how you disable that case.)
+2. **A receiver is already parked** (`recvq` non-empty) → direct handoff: the value is copied straight from the sender's stack to the receiver's stack (`send()` → one `memmove`), completely bypassing the buffer. Two reasons for this: (a) performance — one copy instead of two (sender→buffer, buffer→receiver); (b) it's required by the invariant above — buffer and waiting-receivers can't coexist.
+3. **Buffer has room** (`qcount < dataqsiz`) → value goes into `buf[sendx]`, `sendx` advances (wrapping), `qcount++`. No blocking.
+4. **No receiver, no room** → if non-blocking (`select` with `default`), return false immediately. Otherwise: build a `sudog`, enqueue it on `sendq`, call `gopark` — the goroutine leaves the scheduler entirely until some receiver wakes it up.
+
+**Why direct handoff (path 2) matters for interviews**: it's the concrete answer to "how does an unbuffered channel actually work" — there's no hidden buffer of size 1; the handshake *is* the synchronization point (this is also why unbuffered channel send/receive is often described as "happens concurrently with" rather than "happens before" the matching operation, from the Memory Model note).
+
+**`chanrecv` — the mirror image** (`chan.go` ~line 524): same four cases as `chansend`, reversed — nil channel blocks forever; a waiting sender gets served via `recv()`; data already in the buffer is taken directly; otherwise the receiver parks (`sudog` on `recvq`).
+
+**`recv()` — the "full buffer + waiting sender" trick** (~line 702): when the buffer is completely full *and* a sender is already parked waiting, Go doesn't just hand the sender's value straight to the receiver — it does a **slot swap**: the oldest item (at `recvx`, the head of the circular buffer) goes to the receiver, and the parked sender's value is written into that exact same now-empty slot. Nothing shifts, order is preserved, and it's still just one extra copy, not a shift of the whole buffer.
+
+**`sudog` — the "waiting ticket"**: a lightweight struct created only when a goroutine has to park on a channel (or similar primitive). Holds: `g` (which goroutine), `elem` (pointer to the value being sent/received), `c` (which channel), `success` (did it get real data, or did the channel just get closed). When the other side is ready, it looks up the `sudog` at the front of the wait queue and calls `goready(sg.g)` to wake exactly that goroutine — not a broadcast, a targeted wakeup.
+
+## Bounded channel from scratch — mutex + slice
+
+In Version 1 (append + buf[1:]), removing an element drops the front pointer, leaving orphaned memory at the beginning that triggers costly realocations and continuous memory copies during append.Version 2 (Ring Buffer with head/tail) fixes this by reusing fixed memory—incrementing pointer indices wrapping around via modulo (%), yielding true $\mathcal{O}(1)$ operations with zero memory allocations or slice reslicing overhead.
