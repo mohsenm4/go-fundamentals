@@ -1078,3 +1078,31 @@ _Read (src/runtime/chan.go — hchan struct + file-top comments): 2026-09-03_
 ## Bounded channel from scratch — mutex + slice
 
 In Version 1 (append + buf[1:]), removing an element drops the front pointer, leaving orphaned memory at the beginning that triggers costly realocations and continuous memory copies during append.Version 2 (Ring Buffer with head/tail) fixes this by reusing fixed memory—incrementing pointer indices wrapping around via modulo (%), yielding true $\mathcal{O}(1)$ operations with zero memory allocations or slice reslicing overhead.
+
+## RWMutex — readers don't block readers
+
+`sync.RWMutex` has two locks: `RLock` for readers and `Lock` for writers.
+Many readers can hold `RLock` at the same time; a writer needs everyone out.
+Use it when reads are far more common than writes (config, caches).
+Writer starvation problem: if readers keep coming, a writer could wait forever.
+Go's fix: once a writer calls `Lock` and is waiting, new readers block until
+that writer is done. So a pending writer stops the reader stream.
+(To verify in `sync/rwmutex.go` on Tuesday: `readerCount` goes negative while
+a writer is pending.)
+
+## Buffered channel happens-before: k-th receive → (k+C)-th send
+
+For a channel with capacity C, the k-th receive happens-before the (k+C)-th
+send completes. Example, C = 1: send #1 fills the buffer; send #2 cannot
+finish until receive #1 has happened. So a buffered channel of size C works
+as a counting semaphore with C slots — at most C sends can be "in flight"
+without a matching receive. With C = 0 (unbuffered) this collapses to
+"receive happens-before send completes", i.e. a rendezvous.
+
+## atomic vs non-atomic access to the same variable
+
+Atomic operations only give guarantees if *every* access to that variable is
+atomic. If one goroutine does `atomic.StoreInt64(&x, 1)` and another reads
+`x` with a plain `x == 1`, that is still a data race — the race detector will
+flag it. Mixing is never "half safe". Rule: pick one — all `atomic.*`, or
+all under the same mutex.
