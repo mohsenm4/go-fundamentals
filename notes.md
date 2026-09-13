@@ -1106,3 +1106,12 @@ atomic. If one goroutine does `atomic.StoreInt64(&x, 1)` and another reads
 `x` with a plain `x == 1`, that is still a data race — the race detector will
 flag it. Mixing is never "half safe". Rule: pick one — all `atomic.*`, or
 all under the same mutex.
+
+**## select.go — selectgo three-pass walkthrough**
+
+Pass 1 checks cases in randomized `pollorder` to find a case that is already ready.
+Pass 2 creates one `sudog` per case, enqueues them on the channels, and parks the goroutine.
+When one case becomes ready, its `sudog` wakes the goroutine; Pass 3 removes all the losing `sudog`s.
+`pollorder` is randomized so that when multiple cases are ready, selection is not biased toward one case.
+`lockorder` is sorted by channel address (`sortkey`) so every goroutine locks shared channels in the same order, avoiding deadlock.
+A `nil` channel is skipped from both orders, so its case can never proceed; if it is the only case, the select blocks forever.
