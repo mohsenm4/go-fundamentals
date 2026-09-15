@@ -1131,3 +1131,11 @@ a waiter can repeatedly lose the race to newly arriving goroutines, so it can st
 
 **Exit from starvation — who, when, why in `lockSlow`**:
 the **waiting goroutine** exits starvation mode when it receives ownership and sees that either **it waited less than 1 ms** or **it is the last waiter**. This check belongs in `lockSlow` because the waiting goroutine knows its own `waitStartTime` and can decide whether starvation mode is still necessary; `Unlock` only performs the handoff. The code removes `mutexStarving` with `delta -= mutexStarving` and returns the Mutex to normal mode.
+
+WaitGroup internals — one uint64, two counters:
+
+(1) task counter — the high 32 bits of state store how many tasks are still running; Add(1) increases it and Done() decreases it; (2) waiter count — the low 31 bits store how many goroutines are currently waiting in Wait(). One atomic uint64 is used so the counter and waiter count can be updated and checked together atomically, avoiding inconsistent state between two separate values. When the last Done() makes the counter 0, it releases the semaphore once for each waiter, so all waiters wake.
+
+RWMutex — negative readerCount:
+
+(1) existing readers — when a writer arrives while readers are active, the writer must wait for those readers to finish; readerWait tracks how many active readers the writer is waiting for; (2) new readers — the writer makes readerCount negative by subtracting rwmutexMaxReaders, so new RLock() calls see readerCount < 0 and block on readerSem until the writer finishes.
