@@ -1115,3 +1115,19 @@ When one case becomes ready, its `sudog` wakes the goroutine; Pass 3 removes all
 `pollorder` is randomized so that when multiple cases are ready, selection is not biased toward one case.
 `lockorder` is sorted by channel address (`sortkey`) so every goroutine locks shared channels in the same order, avoiding deadlock.
 A `nil` channel is skipped from both orders, so its case can never proceed; if it is the only case, the select blocks forever.
+
+## `sync.Mutex` — normal vs starvation mode**
+
+**State bits — one `int32` stores the Mutex state****: `state` packs several pieces of information into one integer: `mutexLocked` means the Mutex is locked, `mutexWoken` means a waiter has already been woken, `mutexStarving` means the Mutex is in starvation mode, and the remaining high bits store the number of waiting goroutines.
+
+**Normal mode**:
+when the Mutex is locked and a goroutine is waiting, Go can wake that waiter, but the waiter does **not** automatically own the Mutex — it competes with new goroutines that arrive after it. New goroutines have an advantage because they are already running on the CPU. This gives better performance because a goroutine can acquire the Mutex several times in a row.
+
+**Why starvation happens**: 
+a waiter can repeatedly lose the race to newly arriving goroutines, so it can stay in the queue for too long. If a waiter has been waiting for more than about **1 ms** (`starvationThresholdNs = 1e6`), `lockSlow` marks it as starving. The goal is to prevent pathological tail latency where one goroutine waits far longer than the others.
+
+**Starvation mode — two important differences**: 
+(1) **no spinning** — new/waiting goroutines don't spin because they cannot take the Mutex from the handoff; (2) **direct handoff** — when the owner calls `Unlock`, ownership is handed directly to the waiter at the front of the queue instead of making it compete with new goroutines. New arriving goroutines are forced to queue at the tail.
+
+**Exit from starvation — who, when, why in `lockSlow`**:
+the **waiting goroutine** exits starvation mode when it receives ownership and sees that either **it waited less than 1 ms** or **it is the last waiter**. This check belongs in `lockSlow` because the waiting goroutine knows its own `waitStartTime` and can decide whether starvation mode is still necessary; `Unlock` only performs the handoff. The code removes `mutexStarving` with `delta -= mutexStarving` and returns the Mutex to normal mode.
