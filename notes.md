@@ -1139,3 +1139,15 @@ WaitGroup internals — one uint64, two counters:
 RWMutex — negative readerCount:
 
 (1) existing readers — when a writer arrives while readers are active, the writer must wait for those readers to finish; readerWait tracks how many active readers the writer is waiting for; (2) new readers — the writer makes readerCount negative by subtracting rwmutexMaxReaders, so new RLock() calls see readerCount < 0 and block on readerSem until the writer finishes.
+
+## sync.Once — why CAS alone is not enough
+
+**Two guarantees.** `Once` gives us two guarantees: `f` runs exactly once, and when `Do` returns, `f` has finished. Both matter for safe initialization.
+
+**What CAS gives you.** CAS can guarantee exactly-once, but not that everyone waits for `f` to finish. For example: G1 starts `f` and sets `done`; G2 sees `done == 1` and returns immediately — while G1 is still running `f`. That’s why the test can show 99/100 returning too early.
+
+**How Once fixes it.** A Mutex makes the losing goroutines wait until `f` finishes. After locking, we double-check `done` because another goroutine may have already completed it. `done` is stored after `f` using `defer`; the two defers run LIFO, so `Store(1)` happens before `Unlock()`.
+
+**Why the fast path has no lock.** `Store(1)` after `f` and the fast-path `Load()` create a happens-before relationship, so the lock-free read is safe. We also don't spin: the Mutex lets waiting goroutines sleep instead of burning CPU.
+
+**Panic behavior.** With `Once`, `done` is set even if `f` panics, so `f` won't run again. `OnceFunc` recovers and caches the panic, then re-panics with it for every later caller.
