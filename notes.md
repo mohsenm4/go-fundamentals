@@ -1106,8 +1106,7 @@ atomic. If one goroutine does `atomic.StoreInt64(&x, 1)` and another reads
 `x` with a plain `x == 1`, that is still a data race — the race detector will
 flag it. Mixing is never "half safe". Rule: pick one — all `atomic.*`, or
 all under the same mutex.
-
-**## select.go — selectgo three-pass walkthrough**
+## select.go — selectgo three-pass walkthrough
 
 Pass 1 checks cases in randomized `pollorder` to find a case that is already ready.
 Pass 2 creates one `sudog` per case, enqueues them on the channels, and parks the goroutine.
@@ -1116,35 +1115,35 @@ When one case becomes ready, its `sudog` wakes the goroutine; Pass 3 removes all
 `lockorder` is sorted by channel address (`sortkey`) so every goroutine locks shared channels in the same order, avoiding deadlock.
 A `nil` channel is skipped from both orders, so its case can never proceed; if it is the only case, the select blocks forever.
 
-## `sync.Mutex` — normal vs starvation mode**
+## sync.Mutex — normal vs starvation mode
 
-**State bits — one `int32` stores the Mutex state****: `state` packs several pieces of information into one integer: `mutexLocked` means the Mutex is locked, `mutexWoken` means a waiter has already been woken, `mutexStarving` means the Mutex is in starvation mode, and the remaining high bits store the number of waiting goroutines.
+**State bits — one `int32` stores the Mutex state**: `state` packs several pieces of information into one integer: `mutexLocked` means the Mutex is locked, `mutexWoken` means a waiter has already been woken, `mutexStarving` means the Mutex is in starvation mode, and the remaining high bits store the number of waiting goroutines.
 
 **Normal mode**:
 when the Mutex is locked and a goroutine is waiting, Go can wake that waiter, but the waiter does **not** automatically own the Mutex — it competes with new goroutines that arrive after it. New goroutines have an advantage because they are already running on the CPU. This gives better performance because a goroutine can acquire the Mutex several times in a row.
 
-**Why starvation happens**: 
+**Why starvation happens**:
 a waiter can repeatedly lose the race to newly arriving goroutines, so it can stay in the queue for too long. If a waiter has been waiting for more than about **1 ms** (`starvationThresholdNs = 1e6`), `lockSlow` marks it as starving. The goal is to prevent pathological tail latency where one goroutine waits far longer than the others.
 
-**Starvation mode — two important differences**: 
+**Starvation mode — two important differences**:
 (1) **no spinning** — new/waiting goroutines don't spin because they cannot take the Mutex from the handoff; (2) **direct handoff** — when the owner calls `Unlock`, ownership is handed directly to the waiter at the front of the queue instead of making it compete with new goroutines. New arriving goroutines are forced to queue at the tail.
 
 **Exit from starvation — who, when, why in `lockSlow`**:
 the **waiting goroutine** exits starvation mode when it receives ownership and sees that either **it waited less than 1 ms** or **it is the last waiter**. This check belongs in `lockSlow` because the waiting goroutine knows its own `waitStartTime` and can decide whether starvation mode is still necessary; `Unlock` only performs the handoff. The code removes `mutexStarving` with `delta -= mutexStarving` and returns the Mutex to normal mode.
 
-WaitGroup internals — one uint64, two counters:
+## WaitGroup internals — one uint64, two counters
 
-(1) task counter — the high 32 bits of state store how many tasks are still running; Add(1) increases it and Done() decreases it; (2) waiter count — the low 31 bits store how many goroutines are currently waiting in Wait(). One atomic uint64 is used so the counter and waiter count can be updated and checked together atomically, avoiding inconsistent state between two separate values. When the last Done() makes the counter 0, it releases the semaphore once for each waiter, so all waiters wake.
+(1) task counter — the high 32 bits of `state` store how many tasks are still running; `Add(1)` increases it and `Done()` decreases it; (2) waiter count — the low 31 bits store how many goroutines are currently waiting in `Wait()`. One atomic `uint64` is used so the counter and waiter count can be updated and checked together atomically, avoiding inconsistent state between two separate values. When the last `Done()` makes the counter 0, it releases the semaphore once for each waiter, so all waiters wake.
 
-RWMutex — negative readerCount:
+## RWMutex — negative readerCount
 
-(1) existing readers — when a writer arrives while readers are active, the writer must wait for those readers to finish; readerWait tracks how many active readers the writer is waiting for; (2) new readers — the writer makes readerCount negative by subtracting rwmutexMaxReaders, so new RLock() calls see readerCount < 0 and block on readerSem until the writer finishes.
+(1) existing readers — when a writer arrives while readers are active, the writer must wait for those readers to finish; `readerWait` tracks how many active readers the writer is waiting for; (2) new readers — the writer makes `readerCount` negative by subtracting `rwmutexMaxReaders`, so new `RLock()` calls see `readerCount < 0` and block on `readerSem` until the writer finishes.
 
 ## sync.Once — why CAS alone is not enough
 
 **Two guarantees.** `Once` gives us two guarantees: `f` runs exactly once, and when `Do` returns, `f` has finished. Both matter for safe initialization.
 
-**What CAS gives you.** CAS can guarantee exactly-once, but not that everyone waits for `f` to finish. For example: G1 starts `f` and sets `done`; G2 sees `done == 1` and returns immediately — while G1 is still running `f`. That’s why the test can show 99/100 returning too early.
+**What CAS gives you.** CAS can guarantee exactly-once, but not that everyone waits for `f` to finish. For example: G1 starts `f` and sets `done`; G2 sees `done == 1` and returns immediately — while G1 is still running `f`. That's why the test can show 99/100 returning too early.
 
 **How Once fixes it.** A Mutex makes the losing goroutines wait until `f` finishes. After locking, we double-check `done` because another goroutine may have already completed it. `done` is stored after `f` using `defer`; the two defers run LIFO, so `Store(1)` happens before `Unlock()`.
 
