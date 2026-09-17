@@ -18,7 +18,8 @@ then compared against it. Notes live in `notes.md`.
 
 ```sh
 go test -race ./...
-
+```
 
 ```bash
 git add README.md && git commit -m "add README" && git push
+```
