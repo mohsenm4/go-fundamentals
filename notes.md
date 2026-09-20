@@ -1150,3 +1150,11 @@ the **waiting goroutine** exits starvation mode when it receives ownership and s
 **Why the fast path has no lock.** `Store(1)` after `f` and the fast-path `Load()` create a happens-before relationship, so the lock-free read is safe. We also don't spin: the Mutex lets waiting goroutines sleep instead of burning CPU.
 
 **Panic behavior.** With `Once`, `done` is set even if `f` panics, so `f` won't run again. `OnceFunc` recovers and caches the panic, then re-panics with it for every later caller.
+
+## context.go — how cancellation propagates
+
+1. **Directly** means the child is added to `parent.children` without creating a goroutine; the third path creates **one goroutine per child** that stays alive until either side is canceled, so 1,000 children on a custom parent means 1,000 goroutines. That’s why libraries shouldn’t create their own `Context` implementations.
+
+2. The child is removed from the parent **last** because the parent has its own lock; locking the parent in the middle would reverse the lock order used by `propagateCancel` and could cause a deadlock.
+
+3. `done` is **lazy** because many contexts never call `Done()`, so creating a channel for every `WithCancel` would be wasted work; `atomic.Value` keeps `Done()` fast without needing a lock.
