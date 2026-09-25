@@ -1158,3 +1158,13 @@ the **waiting goroutine** exits starvation mode when it receives ownership and s
 2. The child is removed from the parent **last** because the parent has its own lock; locking the parent in the middle would reverse the lock order used by `propagateCancel` and could cause a deadlock.
 
 3. `done` is **lazy** because many contexts never call `Done()`, so creating a channel for every `WithCancel` would be wasted work; `atomic.Value` keeps `Done()` fast without needing a lock.
+
+## sync.Pool — victim cache and per-P locals
+
+Each `sync.Pool` has a local area for each P. The `private` part belongs only to the current P, so after `pin()` it can be accessed without a lock. The `shared` part can be accessed by other Ps too, so it uses atomic operations to coordinate access.
+
+The `victim` cache keeps the previous generation of pool items. During cleanup, the current locals are moved to `victim`, while the old victim is dropped. This prevents objects from being thrown away immediately at every GC and gives them one more chance to be reused.
+
+`pin()` normally finds the local area for the current P. If the current P does not fit in the existing local array, `pin()` falls back to `pinSlow()`. `pinSlow()` unpins first because it needs to take the pool-related lock, and a pinned goroutine cannot safely do that.
+
+GC clears unused pool objects because a `sync.Pool` is only a temporary reuse mechanism. Without cleanup, unused objects could stay reachable through the pool and cause memory retention, keeping memory occupied even when those objects were no longer useful.
