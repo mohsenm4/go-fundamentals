@@ -6,7 +6,7 @@ then compared against it. Notes live in `notes.md`.
 
 | Folder | Source I read | What the exercise shows |
 |---|---|---|
-| `01-numeric-types.go` | spec §Types | overflow and conversion behavior |
+| `01-numeric-types/` | spec §Types | overflow and conversion behavior |
 | `03-payment/` | `io.go`, `sort.Interface` | small interfaces + mock, avoiding interface pollution |
 | `04-hashmap/` | `internal/runtime/maps` (Swiss Tables) | open-addressing map vs stdlib design |
 | `linklist/` | `runtime/slice.go` | linked list + iterator |
@@ -14,7 +14,7 @@ then compared against it. Notes live in `notes.md`.
 | `06-counter/` | Go Memory Model | data race → mutex/atomic, verified with `-race` |
 | `07-bounded-channel/` | `runtime/chan.go` | bounded channel from scratch (+ a cold rebuild from memory) |
 | `07-sync-once/` | `sync/once.go` | why CAS alone is not enough: `BrokenOnce` test proves callers return early |
-| `ColdRebuild/` | — | weekly rebuilds without looking at code or AI |
+| `cold-rebuild/` | — | weekly rebuilds without looking at code or AI |
 
 ```sh
 go test -race ./...
