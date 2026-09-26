@@ -14,6 +14,7 @@ then compared against it. Notes live in `notes.md`.
 | `06-counter/` | Go Memory Model | data race → mutex/atomic, verified with `-race` |
 | `07-bounded-channel/` | `runtime/chan.go` | bounded channel from scratch (+ a cold rebuild from memory) |
 | `07-sync-once/` | `sync/once.go` | why CAS alone is not enough: `BrokenOnce` test proves callers return early |
+| `08-select-nil/` | `runtime/select.go`, `runtime/chan.go` | nil channel silences a select case; nil receive with no default = deadlock (`-deadlock` flag) |
 | `cold-rebuild/` | — | weekly rebuilds without looking at code or AI |
 
 ```sh
