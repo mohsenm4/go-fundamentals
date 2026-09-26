@@ -15,6 +15,7 @@ then compared against it. Notes live in `notes.md`.
 | `07-bounded-channel/` | `runtime/chan.go` | bounded channel from scratch (+ a cold rebuild from memory) |
 | `07-sync-once/` | `sync/once.go` | why CAS alone is not enough: `BrokenOnce` test proves callers return early |
 | `08-select-nil/` | `runtime/select.go`, `runtime/chan.go` | nil channel silences a select case; nil receive with no default = deadlock (`-deadlock` flag) |
+| `09-generics/` | `cmp/cmp.go`, `slices/slices.go` | Map/Filter/Reduce/Set from scratch + 3 cases where generics are the wrong tool |
 | `cold-rebuild/` | — | weekly rebuilds without looking at code or AI |
 
 ```sh
