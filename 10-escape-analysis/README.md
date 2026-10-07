@@ -26,6 +26,8 @@ Rule: write the guess **before** running `go build -gcflags="-m -m"`. Never chan
 | 12b | `q := &point{...}` used only inside the function | heap | `&point{...} does not escape` | Same: `&` alone means nothing. Only "where does the address go?" matters → nowhere → stack. Measured: 0 allocs. | ❌ |
 | 13a | interface var used locally (`rect` value) | stack (call is devirtualized, type is known) | `devirtualizing s.area to rect` · `rect{...} does not escape` · measured: 0 allocs | `s` can only ever hold a `rect`, so the compiler turns `s.area()` into a direct call to `rect.area`; no unknown code touches the value, so it stays in `local`'s frame. | ✅ |
 | 13b | interface passed to `measure(s shape)` | heap (`s.area()` is a call to an unknown method) | `leaking param: s` (in `measure`) · `r escapes to heap` (not `moved to heap: r`) · measured: 1 alloc | Inside `measure`, `s.area()` could call *any* `area` method, so the compiler assumes the data behind `s` leaks; `passed` boxes a **copy** of `r` on the heap, and the variable `r` itself stays on the stack. | ✅ |
+| 14a | own `...any` func, only reads args | stack — both `x` and the `[]any` | `args does not escape` · `... argument does not escape` · `x does not escape` · measured: 0 allocs | `count` is my own code, so the compiler can see it only reads `args`; the `[]any` and the boxed `x` both stay in `callCount`'s frame. In program 3, `Fprintln` is too complex for the compiler to prove that, so `42` escaped. | ✅ |
+| 14b | own `...any` func, stores args in a global | heap — both `x` and the `[]any` | `leaking param: args` · `... argument escapes to heap` · `x escapes to heap` · measured: 2 allocs | `kept = args` puts the slice in a global, so the backing array (1 alloc) and the boxed `x` it points to (1 alloc) must outlive `callKeep`. In program 3 only the value escaped; here the slice escapes too. | ✅ |
 
 ## Note — why goroutines force the heap (program 6)
 
@@ -36,8 +38,13 @@ Rule: write the guess **before** running `go build -gcflags="-m -m"`. Never chan
 - So anything shared between two goroutines must live on the **heap** (the one place both can safely reach).
 - Capture rule: a variable that is **never changed** after capture and is small (≤ 128 bytes) is captured **by value** (copied). Otherwise **by ref** → it moves to the heap. (Program 4: `count++` → by ref. Program 6: `msg` only read → by value.)
 
+## Note — boxing a constant into `any` (program 14 vs program 3)
+
+- Program 14 uses `x := n * 1000` on purpose, not a constant.
+- With a constant, `-m` still says `42 escapes to heap`, but the interface points at a read-only static copy, so the box costs no allocation. Measured: `keep(42)` = 1 alloc (only the `[]any`); `keep(x)` with a non-constant `x` = 2 allocs.
+
 ## Open questions (for later)
 
 - ✅ **Answered by program 6** (`msg` only read → `capturing by value`): if the closure only *reads* `count` (no `count++`), is it still `capturing by ref`? Does `count` still move to heap?
-- **Wednesday benchmark:** program 3 says `42 escapes to heap`. Does `fmt.Println(42)` really allocate at run time? Measure `allocs/op` with `-benchmem`.
+- **Wednesday benchmark:** program 3 says `42 escapes to heap`. Does `fmt.Println(42)` really allocate at run time? Measure `allocs/op` with `-benchmem`. (Partial hint from program 14: boxing a constant uses static data and does **not** allocate. `Fprintln` itself is still unmeasured.)
 - **Wednesday benchmark:** program 5b — compare `allocs/op` for `variable(3)` (24 bytes) vs `variable(10)` (80 bytes). Same "does not escape", different result at run time?
