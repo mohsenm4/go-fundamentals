@@ -24,6 +24,8 @@ Rule: write the guess **before** running `go build -gcflags="-m -m"`. Never chan
 | 11b | `p := &y` used only locally, in a function that also **reads** `global` | stack | nothing about `y` (stays on stack) | Only the flow of `y`'s **own** address matters. `p` is only dereferenced, never stored; reading `*global` has no effect on `y`. | ✅ |
 | 12a | `p := new(point)` used only inside the function | heap (no reason — "`new` sounds like heap") | `new(point) does not escape` | In Go, `new` does **not** choose heap (unlike Java/C++). Escape analysis decides; `p`'s address never leaves `withNew` → stack. Measured: 0 allocs. | ❌ |
 | 12b | `q := &point{...}` used only inside the function | heap | `&point{...} does not escape` | Same: `&` alone means nothing. Only "where does the address go?" matters → nowhere → stack. Measured: 0 allocs. | ❌ |
+| 13a | interface var used locally (`rect` value) | stack (call is devirtualized, type is known) | `devirtualizing s.area to rect` · `rect{...} does not escape` · measured: 0 allocs | `s` can only ever hold a `rect`, so the compiler turns `s.area()` into a direct call to `rect.area`; no unknown code touches the value, so it stays in `local`'s frame. | ✅ |
+| 13b | interface passed to `measure(s shape)` | heap (`s.area()` is a call to an unknown method) | `leaking param: s` (in `measure`) · `r escapes to heap` (not `moved to heap: r`) · measured: 1 alloc | Inside `measure`, `s.area()` could call *any* `area` method, so the compiler assumes the data behind `s` leaks; `passed` boxes a **copy** of `r` on the heap, and the variable `r` itself stays on the stack. | ✅ |
 
 ## Note — why goroutines force the heap (program 6)
 
