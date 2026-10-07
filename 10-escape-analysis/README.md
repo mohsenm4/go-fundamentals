@@ -36,6 +36,8 @@ Rule: write the guess **before** running `go build -gcflags="-m -m"`. Never chan
 | 17b | `arr[:]` used only locally | stack | nothing about `arr` (stays on stack) | The slice points into `arr`, but it never leaves `summed`, so `arr` can stay in the frame. | ✅ |
 | 18a | local `buf` passed to `io.Reader.Read` | heap | `leaking param: r` · `make([]byte, 64) escapes to heap` · measured: 1 alloc | The compiler can't see which `Read` runs behind `io.Reader`, and an unknown `Read` could keep `buf`, so it must assume `buf` escapes. Same reason as 13b. | ✅ |
 | 18b | local `buf` passed to `*strings.Reader.Read` | stack | `r does not escape` · `make([]byte, 64) does not escape` · measured: 0 allocs | With the concrete type the compiler sees `(*strings.Reader).Read`, which only `copy`s into `buf` and never keeps it, so `buf` stays on the stack. | ✅ |
+| 19a | return `box{p: &x}` by value | heap | `moved to heap: x` (flow: `~r0 ← &x` from `box{...}` struct literal element) | The struct is copied out by value, but the copy still holds `&x`, so `x` must outlive `makeBox`. A pointer inside a returned value is the same as returning the pointer. | ✅ |
+| 19b | return `plain{v: x}` by value | stack | nothing about `x` (stays on stack) | `plain{v: x}` copies the **value** of `x`, so nobody needs `x` after `makePlain` returns. | ✅ |
 
 ## Note — why goroutines force the heap (program 6)
 
