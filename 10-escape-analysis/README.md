@@ -38,6 +38,8 @@ Rule: write the guess **before** running `go build -gcflags="-m -m"`. Never chan
 | 18b | local `buf` passed to `*strings.Reader.Read` | stack | `r does not escape` · `make([]byte, 64) does not escape` · measured: 0 allocs | With the concrete type the compiler sees `(*strings.Reader).Read`, which only `copy`s into `buf` and never keeps it, so `buf` stays on the stack. | ✅ |
 | 19a | return `box{p: &x}` by value | heap | `moved to heap: x` (flow: `~r0 ← &x` from `box{...}` struct literal element) | The struct is copied out by value, but the copy still holds `&x`, so `x` must outlive `makeBox`. A pointer inside a returned value is the same as returning the pointer. | ✅ |
 | 19b | return `plain{v: x}` by value | stack | nothing about `x` (stays on stack) | `plain{v: x}` copies the **value** of `x`, so nobody needs `x` after `makePlain` returns. | ✅ |
+| 20a | `&buf{}` used only locally | stack | `&buf{} does not escape` · measured: 0 allocs | Same as 12b: the 64-byte struct's address never leaves `localOnly`, so it stays on the stack. | ✅ |
+| 20b | `&buf{}` then `pool.Put(b)` | heap | `&buf{} escapes to heap` (flow: `b (interface-converted)` → `(*sync.Pool).Put`) · measured: 1 alloc | `Put` keeps the object inside the pool to hand it to a later `Get`, maybe on another goroutine, so `b` must be on the heap. In this program, the pool doesn't save this alloc; it creates it. | ✅ |
 
 ## Note — why goroutines force the heap (program 6)
 
