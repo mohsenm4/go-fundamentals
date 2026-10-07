@@ -32,6 +32,8 @@ Rule: write the guess **before** running `go build -gcflags="-m -m"`. Never chan
 | 15b | `defer` closure with `n++` inside a `for` | heap — closure and `n` | `func literal escapes to heap` · `capturing by ref: n` · `moved to heap: n` · measured: 4 allocs | The compiler can't know at compile time how many defers a loop makes, so each one goes on the runtime's defer list and its closure escapes; the closures share `n` by ref, so `n` moves to the heap too (1 for `n` + 3 closures = 4). | ✅ |
 | 16a | `m[string(b)]` lookup only | no copy at all | `string(b) does not escape` · `b does not escape` · measured: 0 allocs · asm: no `runtime.slicebytetostring` call | For `m[string(b)]` the compiler uses the bytes of `b` directly as the key for the lookup, so no string is built, not even on the stack. | ✅ |
 | 16b | `s := string(b)`, returned | copy, on heap | `string(b) escapes to heap` · `b does not escape` · measured: 1 alloc (`runtime.slicebytetostring`) | A string is immutable, but `b` can change later, so the conversion **must** copy the bytes; the copy is returned, so it lives on the heap (and `b` itself does not escape). | ✅ |
+| 17a | `return arr[:]` (local array) | heap | `moved to heap: arr` (flow: `~r0 ← &arr`) | `arr[:]` is a slice pointing **into** `arr`, so returning it is the same as returning `&arr` (program 1). | ✅ |
+| 17b | `arr[:]` used only locally | stack | nothing about `arr` (stays on stack) | The slice points into `arr`, but it never leaves `summed`, so `arr` can stay in the frame. | ✅ |
 
 ## Note — why goroutines force the heap (program 6)
 
