@@ -34,6 +34,8 @@ Rule: write the guess **before** running `go build -gcflags="-m -m"`. Never chan
 | 16b | `s := string(b)`, returned | copy, on heap | `string(b) escapes to heap` · `b does not escape` · measured: 1 alloc (`runtime.slicebytetostring`) | A string is immutable, but `b` can change later, so the conversion **must** copy the bytes; the copy is returned, so it lives on the heap (and `b` itself does not escape). | ✅ |
 | 17a | `return arr[:]` (local array) | heap | `moved to heap: arr` (flow: `~r0 ← &arr`) | `arr[:]` is a slice pointing **into** `arr`, so returning it is the same as returning `&arr` (program 1). | ✅ |
 | 17b | `arr[:]` used only locally | stack | nothing about `arr` (stays on stack) | The slice points into `arr`, but it never leaves `summed`, so `arr` can stay in the frame. | ✅ |
+| 18a | local `buf` passed to `io.Reader.Read` | heap | `leaking param: r` · `make([]byte, 64) escapes to heap` · measured: 1 alloc | The compiler can't see which `Read` runs behind `io.Reader`, and an unknown `Read` could keep `buf`, so it must assume `buf` escapes. Same reason as 13b. | ✅ |
+| 18b | local `buf` passed to `*strings.Reader.Read` | stack | `r does not escape` · `make([]byte, 64) does not escape` · measured: 0 allocs | With the concrete type the compiler sees `(*strings.Reader).Read`, which only `copy`s into `buf` and never keeps it, so `buf` stays on the stack. | ✅ |
 
 ## Note — why goroutines force the heap (program 6)
 
@@ -43,6 +45,14 @@ Rule: write the guess **before** running `go build -gcflags="-m -m"`. Never chan
   2. Stacks **move**. When a stack grows, Go copies it to a bigger place and fixes pointers *inside that stack only*. A pointer from stack B into stack A would not be fixed.
 - So anything shared between two goroutines must live on the **heap** (the one place both can safely reach).
 - Capture rule: a variable that is **never changed** after capture and is small (≤ 128 bytes) is captured **by value** (copied). Otherwise **by ref** → it moves to the heap. (Program 4: `count++` → by ref. Program 6: `msg` only read → by value.)
+
+## Note — an interface call is a wall (programs 13 + 18)
+
+- Escape analysis works on code the compiler can **see**. Behind an interface it can't see which method will run, so anything passed to an interface method call is assumed to escape. That includes the receiver (13b: `s`) and the arguments (18a: `buf`).
+- There are two ways around the wall:
+  1. **Devirtualization** (13a): if the compiler can prove the concrete type, it calls the method directly.
+  2. **A concrete type in the signature** (18b): `*strings.Reader` instead of `io.Reader`.
+- Trade-off: `io.Reader` in a hot path costs one heap alloc per buffer. That's why `bufio` and `io.CopyBuffer` keep one buffer and reuse it.
 
 ## Note — boxing a constant into `any` (program 14 vs program 3)
 
