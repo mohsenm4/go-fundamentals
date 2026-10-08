@@ -8,6 +8,12 @@ func createUser() *int {
 	return &x
 }
 
+//go:noinline
+func createValue() int {
+	x := 42
+	return x
+}
+
 func main() {
 	p := createUser()
 	fmt.Println(*p)

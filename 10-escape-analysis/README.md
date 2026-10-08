@@ -66,5 +66,17 @@ Rule: write the guess **before** running `go build -gcflags="-m -m"`. Never chan
 ## Open questions (for later)
 
 - ✅ **Answered by program 6** (`msg` only read → `capturing by value`): if the closure only *reads* `count` (no `count++`), is it still `capturing by ref`? Does `count` still move to heap?
-- **Wednesday benchmark:** program 3 says `42 escapes to heap`. Does `fmt.Println(42)` really allocate at run time? Measure `allocs/op` with `-benchmem`. (Partial hint from program 14: boxing a constant uses static data and does **not** allocate. `Fprintln` itself is still unmeasured.)
-- **Wednesday benchmark:** program 5b — compare `allocs/op` for `variable(3)` (24 bytes) vs `variable(10)` (80 bytes). Same "does not escape", different result at run time?
+- ✅ **Answered by benchmark** (`-benchmem`, stdout → `/dev/null`): program 3 says `42 escapes to heap`. Does `fmt.Println(42)` really allocate at run time? **No.** `Fprintln` itself makes 0 allocs: it reuses its printer from a `sync.Pool` (`ppFree` in `fmt/print.go`). The only possible alloc is boxing the value into `any`:
+  - `fmt.Println(42)` (constant) → 0 allocs: static read-only copy (same as program 14).
+  - `fmt.Println(small)` (variable, value 42) → 0 allocs: `runtime.convT64` points into a static table `staticuint64s` for values < 256.
+  - `fmt.Println(big)` (variable, value 1000) → 1 alloc, 8 B: `convT64` calls `mallocgc`.
+  - So "escapes to heap" means "if it needs a box, the box is on the heap". It does not mean "always allocates". (~600 ns/op in all three cases. Most of that is the `write` syscall.)
+- ✅ **Answered by benchmark:** program 5b — compare `allocs/op` for `variable(3)` (24 bytes) vs `variable(10)` (80 bytes). Same "does not escape", different result at run time? **Yes:** `variable(3)` → 0 allocs, `variable(10)` → 1 alloc, 80 B (see table below).
+
+## Benchmarks (Go 1.27.1, Apple M1, `-benchmem`)
+
+| # | Escapes | Fixed | My guess | Why (1 sentence) |
+|---|---------|-------|----------|------------------|
+| 1 | `createUser() *int`: 7.34 ns · 8 B · 1 alloc | `createValue() int`: 2.06 ns · 0 B · 0 allocs | pointer faster ("no copy") ❌ | Returning `&x` moves `x` to the heap, so every call pays for `mallocgc` (plus GC work later), and copying an 8-byte `int` costs almost nothing. |
+| 18 | `readIface(io.Reader)`: 17.40 ns · 64 B · 1 alloc | `readConcrete(*strings.Reader)`: 4.35 ns · 0 B · 0 allocs | 2× slower ❌ (real: 4×) | Behind `io.Reader` the compiler can't see `Read`, so `buf` escapes and every call pays for a 64-byte heap alloc, which costs more than the read itself. |
+| 5b | `variable(10)`: 13.46 ns · 80 B · 1 alloc | `variable(3)`: 2.21 ns · 0 B · 0 allocs | unclear ❌ | Same code and same "does not escape", but 24 bytes fit the 32-byte stack buffer and 80 bytes don't, so `make` falls back to the heap at run time. |
