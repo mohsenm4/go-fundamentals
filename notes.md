@@ -1171,3 +1171,7 @@ GC clears unused pool objects because a `sync.Pool` is only a temporary reuse me
 ## mgc.go — GC cycle
 
 One GC cycle has four phases: sweep termination (stop-the-world), mark (concurrent), mark termination (stop-the-world), and sweep (concurrent). Marking is tri-color: it starts from the roots, a grey object is reached but not scanned yet, and marking ends when no grey object is left; everything still white is freed. Because the program changes pointers while marking runs, a write barrier is on during mark: Go's hybrid barrier shades both the old and the new pointer, so stacks never need a second scan. The pacer starts each cycle so marking ends near the heap goal (live heap × (1 + GOGC/100)), and GOMEMLIMIT can start GC earlier when all Go memory gets near the limit.
+
+## pprof — which profile when
+
+When my program uses too much CPU, I use the CPU profile, and I look at which functions consume the most CPU time (`flat` in `top`, or the widest boxes in a flame graph). When memory keeps growing (a leak), I use the heap profile with `inuse_space`; when the GC runs too often, I use `alloc_space` (and `alloc_objects` for many small objects). To find a goroutine leak, I first check the number of goroutines with `runtime.NumGoroutine()`, then I compare two goroutine profiles taken a few seconds apart and look for the stack whose count keeps growing. Today I learned that the heap profile shows where memory was allocated, not who retains it.
